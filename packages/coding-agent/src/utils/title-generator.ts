@@ -30,7 +30,7 @@ import type { Settings } from "../config/settings";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
 import { formatTitleUserMessage } from "../tiny/message-preproc";
-import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
+import { isLowSignalTitleInput, NO_TITLE_SENTINEL, normalizeGeneratedTitle } from "../tiny/text";
 import { tinyTitleClient } from "../tiny/title-client";
 
 import { cfgRetryModelFallback } from "../session/settings";
@@ -502,15 +502,23 @@ async function generateTitleOnlineWithModels(
 				continue;
 			}
 
-			const title = normalizeGeneratedTitle(extractGeneratedTitle(response.content), firstMessage);
+			const replyText = titleReplyText(response.content);
+			const candidate = extractGeneratedTitle(replyText);
+			const title = normalizeGeneratedTitle(candidate, firstMessage);
 
 			if (!title) {
+				// A decline is this model's answer to the prompt, not a failure: asking
+				// the remaining candidates the same question only buys the title from
+				// the least instruction-following one (issue #20168). The caller retries
+				// on a later user message.
+				const declined = isTitleDecline(replyText, candidate);
 				logger.debug("title-generator: no title returned", {
 					...modelContext,
-					reason: "model-returned-none",
+					reason: declined ? "model-declined" : "model-returned-none",
 					usage: response.usage,
 					stopReason: response.stopReason,
 				});
+				if (declined) return null;
 				continue;
 			}
 
@@ -541,13 +549,39 @@ async function generateTitleOnlineWithModels(
 	return null;
 }
 
-function extractGeneratedTitle(contentBlocks: AssistantMessage["content"]): string {
+/** The reply's visible text: a title model answers in text blocks only. */
+function titleReplyText(contentBlocks: AssistantMessage["content"]): string {
 	let textTitle = "";
 	for (const content of contentBlocks) {
 		if (content.type === "text") {
 			textTitle += content.text;
 		}
 	}
+	return textTitle;
+}
+
+/**
+ * Whether the reply is the decline the title prompt mandates for a message with
+ * no task to name — `<title>none</title>`, `<title/>`, or a bare `none` under an
+ * assistant prefill — rather than output no title could be parsed from.
+ *
+ * @param replyText The reply's visible text
+ * @param candidate The title {@link extractGeneratedTitle} read from it
+ */
+function isTitleDecline(replyText: string, candidate: string): boolean {
+	const marked = extractVisibleMarkedTitle(replyText);
+	if (marked !== undefined && marked.trim() === "") return true;
+	return (
+		candidate
+			.trim()
+			.replace(/^["']|["']$/g, "")
+			.replace(/[.!?]$/, "")
+			.trim()
+			.toLowerCase() === NO_TITLE_SENTINEL
+	);
+}
+
+function extractGeneratedTitle(textTitle: string): string {
 	// Stay lenient: prefer the first closed title marker in visible text, then
 	// fall back to a plain sentence after stripping only known leading leaked
 	// thinking envelopes plus any stray/unclosed title tag fragment. Reject a

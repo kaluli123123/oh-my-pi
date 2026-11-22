@@ -869,6 +869,50 @@ describe("title generator", () => {
 		expect(completeSimpleMock.mock.calls[0]?.[0]).toBe(smolModel);
 		expect(completeSimpleMock.mock.calls[1]?.[0]).toBe(fallbackModel);
 	});
+
+	// Issue #20168: a model that answers the prompt's `none` sentinel declined on
+	// purpose; walking on asks the same greeting of every remaining candidate and
+	// takes the title from the least instruction-following one.
+	const declineCases: Array<[string, string | null, number]> = [
+		["<title>none</title>", null, 1],
+		["<title/>", null, 1],
+		[
+			"Sure! Here is a title for your session, hope you like it: Investigate the resolver thoroughly",
+			"Recovered Title",
+			2,
+		],
+	];
+	it.each(declineCases)(
+		"ends the candidate walk on %s but keeps walking past unparsable output",
+		async (reply, expected, requests) => {
+			const smolModel = getModelOrThrow("claude-opus-4-8");
+			const fallbackModel = getModelOrThrow("claude-sonnet-4-5");
+			const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockImplementation(async model => {
+				if (model.id === smolModel.id)
+					return { stopReason: "stop", content: [{ type: "text", text: reply }] } as never;
+				return { stopReason: "stop", content: [{ type: "text", text: "<title>Recovered Title</title>" }] } as never;
+			});
+			const settings = Settings.isolated({
+				modelRoles: { smol: `${smolModel.provider}/${smolModel.id}` },
+				"retry.fallbackChains": {
+					[`${smolModel.provider}/${smolModel.id}`]: [`${fallbackModel.provider}/${fallbackModel.id}`],
+				},
+				"retry.modelFallback": true,
+			});
+
+			const title = await generateSessionTitle(
+				"Investigate the resolver",
+				createRegistry(smolModel, [smolModel, fallbackModel]),
+				settings,
+				undefined,
+				fallbackModel,
+			);
+
+			expect(title).toBe(expected);
+			expect(completeSimpleMock).toHaveBeenCalledTimes(requests);
+			expect(completeSimpleMock.mock.calls[0]?.[0]).toBe(smolModel);
+		},
+	);
 });
 
 // The terminal title runtime is a module-global. `emitTerminalTitle()` composes
